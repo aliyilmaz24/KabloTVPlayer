@@ -3,6 +3,7 @@ package com.kablotv.player
 import android.app.Activity
 import android.content.SharedPreferences
 import android.graphics.Color
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -14,8 +15,12 @@ import android.widget.TextView
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -33,12 +38,15 @@ class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private var player: ExoPlayer? = null
 
+    // HTTP isteklerine kanal başına Referer/Origin eklemek için kullanılan kaynak fabrikası
+    private lateinit var httpFactory: DefaultHttpDataSource.Factory
+
     private var currentIndex = 0
     private var listOpen = false
     private var category = Category.ALL
     private val digits = StringBuilder()
 
-    // Mevcut kanal için denenecek kaynaklar (önce iptv-org, sonra resmi fallback)
+    // Mevcut kanal için denenecek adresler: 1. ana, 2. yedek, 3. iptv-org güncel link
     private var candidates: List<String> = emptyList()
     private var attempt = 0
 
@@ -46,7 +54,21 @@ class MainActivity : Activity() {
 
     private val hideOsd = Runnable { osd.visibility = View.GONE }
     private val commitDigits = Runnable { commitNumber() }
+    private val switchChannel = Runnable { startPlayback() }
     private val retryPlay = Runnable { startPlayback() }
+
+    private val playerListener = object : Player.Listener {
+        override fun onPlayerError(error: PlaybackException) {
+            attempt++
+            if (attempt < candidates.size) {
+                showOsd("Kaynak açılamadı, yedek kaynak deneniyor…")
+                handler.removeCallbacks(retryPlay)
+                handler.postDelayed(retryPlay, 1500)
+            } else {
+                showOsd("Bu kanal şu an açılamıyor")
+            }
+        }
+    }
 
     // ---------------------------------------------------------------- Yaşam döngüsü
 
@@ -65,6 +87,12 @@ class MainActivity : Activity() {
         channelList.layoutManager = LinearLayoutManager(this)
         channelList.adapter = adapter
 
+        httpFactory = DefaultHttpDataSource.Factory()
+            .setUserAgent("Mozilla/5.0 (Linux; Android 7.1.2; Philips TV) AppleWebKit/537.36 Chrome/120.0 Safari/537.36")
+            .setConnectTimeoutMs(10_000)
+            .setReadTimeoutMs(15_000)
+            .setAllowCrossProtocolRedirects(true)
+
         // Son izlenen kanal (yoksa TRT 1)
         val lastNumber = prefs.getInt("last_channel", 22)
         currentIndex = Channels.indexOf(lastNumber).coerceAtLeast(0)
@@ -75,16 +103,29 @@ class MainActivity : Activity() {
             if (count > 0) {
                 showOsd("Yayın listesi güncellendi: $count kanal")
             } else {
-                showOsd("Liste güncellenemedi, resmi yayın linkleri kullanılıyor")
+                showOsd("Liste güncellenemedi, yerleşik linkler kullanılıyor")
             }
-            // Henüz hiçbir yayın yüklenmediyse şimdi başlat
             if (player?.currentMediaItem == null) playChannel(currentIndex)
         }
     }
 
     override fun onStart() {
         super.onStart()
+
+        // 1080p'ye kadar en yüksek kaliteyi zorla
+        val trackSelector = DefaultTrackSelector(this)
+        trackSelector.setParameters(
+            trackSelector.buildUponParameters()
+                .setMaxVideoSize(1920, 1080)
+                .setForceHighestSupportedBitrate(true)
+                .build()
+        )
+
         val p = ExoPlayer.Builder(this)
+            .setTrackSelector(trackSelector)
+            .setMediaSourceFactory(
+                DefaultMediaSourceFactory(DefaultDataSource.Factory(this, httpFactory))
+            )
             .setLoadControl(
                 DefaultLoadControl.Builder()
                     .setBufferDurationsMs(
@@ -97,16 +138,7 @@ class MainActivity : Activity() {
             )
             .build()
 
-        p.addListener(object : Player.Listener {
-            override fun onPlayerError(error: PlaybackException) {
-                // Sıradaki kaynağa geç (iptv-org -> resmi fallback -> ...)
-                attempt++
-                showOsd("Yayın hatası, alternatif kaynak deneniyor…")
-                handler.removeCallbacks(retryPlay)
-                handler.postDelayed(retryPlay, 2000)
-            }
-        })
-
+        p.addListener(playerListener)
         playerView.player = p
         player = p
         playChannel(currentIndex)
@@ -122,12 +154,21 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- Oynatma
 
-    /** Kanal için kullanılabilir kaynakları sırayla döndürür: önce iptv-org, sonra resmi fallback. */
+    /** Kanal için denenecek adresler: yerleşik linkler, ardından iptv-org güncel link. */
     private fun buildCandidates(ch: Channel): List<String> {
         val updated = prefs.getString("url_${ch.number}", null)
-        return listOfNotNull(updated, ch.fallbackUrl)
+        return (ch.urls + listOfNotNull(updated))
             .filter { it.isNotBlank() }
             .distinct()
+    }
+
+    /** Kanala özel Referer ve Origin başlıklarını, sonraki isteklere uygular. */
+    private fun applyHeaders(referer: String) {
+        val uri = Uri.parse(referer)
+        val origin = "${uri.scheme}://${uri.host}"
+        httpFactory.setDefaultRequestProperties(
+            mapOf("Referer" to referer, "Origin" to origin)
+        )
     }
 
     private fun playChannel(index: Int) {
@@ -136,27 +177,32 @@ class MainActivity : Activity() {
         val ch = Channels.ALL[index]
 
         prefs.edit().putInt("last_channel", ch.number).apply()
+
+        // Önceki kanala ait bekleyen işleri iptal et, eski yayını durdur
         handler.removeCallbacks(retryPlay)
+        handler.removeCallbacks(switchChannel)
+        player?.stop()
 
         candidates = buildCandidates(ch)
         attempt = 0
 
         if (candidates.isEmpty()) {
-            player?.clearMediaItems()
             showOsd("${ch.number}  ${ch.name}  ·  yayın bulunamadı")
             return
         }
 
-        startPlayback()
         showOsd("${ch.number}  ${ch.name}  ·  ${ch.category.label}")
+        // Hızlı geçişlerde yalnızca son seçilen kanal açılsın (0,4 sn bekleme)
+        handler.postDelayed(switchChannel, 400)
     }
 
-    /** Mevcut deneme sırasındaki kaynağı oynatıcıya yükler. */
+    /** Mevcut deneme sırasındaki adresi, kanalın Referer başlığıyla oynatıcıya yükler. */
     private fun startPlayback() {
         val p = player ?: return
-        if (candidates.isEmpty()) return
-        val url = candidates[attempt % candidates.size]
-        p.setMediaItem(MediaItem.fromUri(url))
+        if (attempt >= candidates.size) return
+        val ch = Channels.ALL[currentIndex]
+        applyHeaders(ch.referer)
+        p.setMediaItem(MediaItem.fromUri(candidates[attempt]))
         p.prepare()
         p.playWhenReady = true
     }
